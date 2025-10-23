@@ -1,0 +1,385 @@
+---
+title: "A2"
+output: html_document
+---
+
+
+```{r,echo = FALSE}
+library(data.table)
+library(tidytext)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(ggpubr)
+library(splines)
+library(mgcv)
+library(kableExtra)
+library(httr)
+library(jsonlite)
+library(purrr)
+library(ggcorrplot)
+library(scales)
+library(tm)
+library(SnowballC)
+library(wordcloud2)
+library(slam)
+```
+
+
+```{r,echo = FALSE}
+census_16_metro <- read.csv("census_16_metro.csv")
+census_16_other <- read.csv("census_16_other.csv")
+census_21_metro <- read.csv("census_21_metro.csv")
+census_21_other <- read.csv("census_21_other.csv")
+
+# Load shapefile
+canada_provinces_sf <- st_read("Canada_Provinces.shp")
+```
+
+
+
+```{r,echo = FALSE}
+# --- Load and Select Columns ---
+aging_cols <- c(
+  "PR", "CMA", "AGEGRP", "Sex", "Gender", "MarStH",
+  "HHSIZE", "GENSTAT", "EmpIn", "HDGREE", "WEIGHT", "NAICS"
+)
+
+aging_16 <- census_16_metro %>% select(any_of(aging_cols))
+aging_21 <- census_21_metro %>% select(any_of(aging_cols))
+
+# --- Clean Function ---
+clean_census_data <- function(df) {
+  df %>%
+    drop_na() %>%
+    mutate(across(
+      where(is.numeric),
+      ~ {
+        q1 <- quantile(., 0.25, na.rm = TRUE)
+        q3 <- quantile(., 0.75, na.rm = TRUE)
+        iqr <- q3 - q1
+        lower <- q1 - 1.5 * iqr
+        upper <- q3 + 1.5 * iqr
+        ifelse(. < lower | . > upper, NA, .)
+      }
+    )) %>%
+    drop_na()
+}
+
+aging_16_clean <- clean_census_data(aging_16)
+aging_21_clean <- clean_census_data(aging_21)
+
+# --- Healthcare Classification Function ---
+is_healthcare_16 <- function(naics_code) {
+  # 2016: Healthcare = code 15
+  ifelse(naics_code == 15, 1, 0)
+}
+
+is_healthcare_21 <- function(naics_code) {
+  # 2021: Healthcare = NAICS starting with "62"
+  naics_char <- as.character(naics_code)
+  ifelse(grepl("^62", naics_char), 1, 0)
+}
+
+# --- Add Year, Gender, Healthcare ---
+aging_16_clean <- aging_16_clean %>%
+  mutate(
+    Year = 2016,
+    Gender = case_when(
+      !is.na(Sex) & Sex == 1 ~ "Female",
+      !is.na(Sex) & Sex == 2 ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    NAICS_Healthcare = is_healthcare_16(NAICS)
+  )
+
+aging_21_clean <- aging_21_clean %>%
+  mutate(
+    Year = 2021,
+    Gender = case_when(
+      !is.na(Gender) & Gender == 1 ~ "Female",
+      !is.na(Gender) & Gender == 2 ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    NAICS_Healthcare = is_healthcare_21(NAICS)
+  )
+
+# --- Rename Columns ---
+aging_16_clean <- aging_16_clean %>% rename(
+  Province_Code = PR,
+  CMA_Code = CMA,
+  Age_Group = AGEGRP,
+  Marital_Status = MarStH,
+  Household_Size = HHSIZE,
+  Education = HDGREE,
+  Employment_Status = EmpIn,
+  General_Status = GENSTAT,
+  Weight = WEIGHT
+)
+
+aging_21_clean <- aging_21_clean %>% rename(
+  Province_Code = PR,
+  CMA_Code = CMA,
+  Age_Group = AGEGRP,
+  Household_Size = HHSIZE,
+  Education = HDGREE,
+  Employment_Status = EmpIn,
+  General_Status = GENSTAT,
+  Weight = WEIGHT
+)
+
+# --- Select and Merge ---
+final_cols <- c(
+  "Province_Code", "CMA_Code", "Gender", "Age_Group", "Marital_Status",
+  "Household_Size", "Education", "Employment_Status", "General_Status",
+  "Weight", "NAICS_Healthcare", "Year"
+)
+
+aging_16_clean <- aging_16_clean %>% select(any_of(final_cols))
+aging_21_clean <- aging_21_clean %>% select(any_of(final_cols))
+
+aging_all <- bind_rows(aging_16_clean, aging_21_clean)
+
+```
+
+
+
+
+```{r,echo = FALSE}
+library(dplyr)
+library(ggplot2)
+
+# Define age range mapping
+age_labels <- c(
+  "0-4", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34",
+  "35-39", "40-44", "45-49", "50-54", "55-59", "60-64",
+  "65-69", "70-74", "75-79", "80-84", "85-89", "90+"
+)
+
+pyramid_data <- aging_all %>%
+  # keep valid age + gender
+  filter(!is.na(Age_Group), !is.na(Gender)) %>%
+  mutate(
+    # Ensure Age_Group within bounds
+    Age_Range = case_when(
+      Age_Group >= 3 & Age_Group <= 21 ~ age_labels[Age_Group - 2],
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Age_Range)) %>%
+  group_by(Year, Age_Range, Gender) %>%
+  summarise(Count = sum(Weight, na.rm = TRUE), .groups = "drop") %>%
+  # Negative for male so bars go left
+  mutate(Count = ifelse(Gender == "Male", -Count, Count))
+
+library(scales)
+
+ggplot(pyramid_data, aes(x = Age_Range, y = Count, fill = Gender)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  facet_wrap(~Year) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) {
+      x <- abs(x)
+      case_when(
+        x >= 1e6 ~ paste0(round(x / 1e6, 1), "M"),
+        x >= 1e3 ~ paste0(round(x / 1e3, 0), "k"),
+        TRUE ~ as.character(x)
+      )
+    },
+    breaks = pretty(pyramid_data$Count, n = 6),
+    name = "Population (Weighted)"
+  ) +
+  scale_fill_manual(values = c("Female" = "#E07A5F", "Male" = "#3D405B")) +
+  labs(
+    title = "Population Pyramid by Age Group and Gender (2016 vs 2021)",
+    x = "Age Range",
+    fill = "Gender"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+```
+
+
+
+
+```{r,echo = FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# 1️⃣ Compute senior percentage for each year
+seniors_province <- aging_all %>%
+  filter(Age_Group %in% 16:21) %>%   # 65+ age groups
+  group_by(Province_Code, Year) %>%
+  summarise(Seniors = n(), .groups = "drop") %>%
+  left_join(
+    aging_all %>%
+      group_by(Province_Code, Year) %>%
+      summarise(Total = n(), .groups = "drop"),
+    by = c("Province_Code", "Year")
+  ) %>%
+  mutate(
+    Senior_Percent = Seniors / Total * 100,
+    PR = str_pad(Province_Code, width = 2, side = "left", pad = "0")
+  )
+
+# 2️⃣ Compute change from 2016 to 2021
+senior_change <- seniors_province %>%
+  select(PR, Year, Senior_Percent) %>%
+  pivot_wider(names_from = Year, values_from = Senior_Percent) %>%
+  mutate(Change = `2021` - `2016`)
+
+# 3️⃣ Merge with shapefile
+map_data <- canada_provinces_sf %>%
+  left_join(
+    senior_change %>% select(PR, Change),
+    by = c("PRUID" = "PR")
+  )
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Assuming 'map_data' is already created from previous step
+
+ggplot(map_data) +
+  geom_sf(aes(fill = Change), color = "black") +
+  scale_fill_gradient2(
+    low = "#2166AC",       # blue for negative change
+    mid = "white",         # no change
+    high = "#B2182B",      # red for positive change
+    midpoint = 0,
+    na.value = "grey80",    # grey for NA
+    name = "Change in % Seniors"
+  ) +
+  labs(
+    title = "Change in Percentage of Seniors (65+) by Province (2016–2021)",
+    subtitle = "Grey indicates missing data"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+
+```
+
+
+
+
+
+```{r,echo = FALSE}
+# -----------------------------
+# 3️⃣ Line/Bar Chart: Senior dependency ratio (65+/15-64)
+# -----------------------------
+# Create a mapping of province codes to names
+# Map province codes to names
+province_names <- c(
+  "10" = "Newfoundland and Labrador",
+  "11" = "Prince Edward Island",
+  "12" = "Nova Scotia",
+  "13" = "New Brunswick",
+  "24" = "Quebec",
+  "35" = "Ontario",
+  "46" = "Manitoba",
+  "47" = "Saskatchewan",
+  "48" = "Alberta",
+  "59" = "British Columbia",
+  "60" = "Yukon",
+  "61" = "Northwest Territories",
+  "62" = "Nunavut"
+)
+
+dependency_ratio <- dependency_ratio %>%
+  mutate(Province = province_names[as.character(Province_Code)]) %>%
+  filter(Province %in% c("British Columbia", "Nova Scotia", "Ontario", "Quebec"))
+
+# Plot only the selected provinces
+ggplot(dependency_ratio, aes(x = Province, y = Senior_Dependency_Ratio, fill = factor(Year))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Senior Dependency Ratio by Province (65+/15-64)",
+    x = "Province",
+    y = "Senior Dependency Ratio",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r,echo = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Map province codes to names
+province_names <- c(
+  "10" = "Newfoundland & Labrador",
+  "11" = "Prince Edward Island",
+  "12" = "Nova Scotia",
+  "13" = "New Brunswick",
+  "24" = "Quebec",
+  "35" = "Ontario",
+  "46" = "Manitoba",
+  "47" = "Saskatchewan",
+  "48" = "Alberta",
+  "59" = "British Columbia",
+  "60" = "Yukon",
+  "61" = "Northwest Territories",
+  "62" = "Nunavut"
+)
+
+# Filter provinces to include
+provinces_to_include <- c("British Columbia", "Nova Scotia", "Ontario", "Quebec")
+
+# Compute Senior Percent using total population per province
+seniors_vs_healthcare <- aging_all %>%
+  mutate(Province = province_names[as.character(Province_Code)]) %>%
+  filter(Province %in% provinces_to_include) %>%
+  group_by(Province, Year) %>%
+  summarise(
+    Total_Pop = n(),
+    Seniors = sum(Age_Group >= 16 & Age_Group <= 21), # 65+
+    Healthcare_Worker_Count = sum(NAICS_Healthcare == 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Senior_Percent = Seniors / Total_Pop * 100,
+    Healthcare_Worker_Density = Healthcare_Worker_Count / Total_Pop * 100
+  )
+
+# Reshape for plotting
+long_data <- seniors_vs_healthcare %>%
+  select(Province, Year, Senior_Percent, Healthcare_Worker_Density) %>%
+  pivot_longer(cols = c(Senior_Percent, Healthcare_Worker_Density),
+               names_to = "Metric", values_to = "Value")
+
+# Plot
+ggplot(long_data, aes(x = Province, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~Year) +
+  labs(
+    title = "Senior Population vs Healthcare Worker Density",
+    x = "Province",
+    y = "Percentage",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
