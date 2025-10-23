@@ -1,0 +1,570 @@
+---
+title: "A2"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r,echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+library(data.table)
+library(tidytext)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(ggpubr)
+library(splines)
+library(mgcv)
+library(kableExtra)
+library(httr)
+library(jsonlite)
+library(purrr)
+library(ggcorrplot)
+library(scales)
+library(tm)
+library(SnowballC)
+library(wordcloud2)
+library(slam)
+library(sf)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(patchwork)
+
+```
+
+
+```{r,echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+census_16_metro <- read.csv("census_16_metro.csv")
+census_16_other <- read.csv("census_16_other.csv")
+census_21_metro <- read.csv("census_21_metro.csv")
+census_21_other <- read.csv("census_21_other.csv")
+
+# Load shapefile
+canada_provinces_sf <- st_read("Canada_Provinces.shp")
+```
+
+
+
+
+
+```{r,echo = FALSE}
+library(dplyr)
+
+# --- Columns to select ---
+aging_cols <- c(
+  "PR", "CMA", "AGEGRP", "Sex", "Gender", "NAICS", "WEIGHT"
+)
+
+# --- Combine metro and other datasets for 2016 ---
+aging_16 <- bind_rows(
+  census_16_metro %>% select(any_of(aging_cols)) %>% mutate(Metro_Status = "Metro"),
+  census_16_other %>% select(any_of(aging_cols)) %>% mutate(Metro_Status = "Other")
+)
+
+# --- Combine metro and other datasets for 2021 ---
+aging_21 <- bind_rows(
+  census_21_metro %>% select(any_of(aging_cols)) %>% mutate(Metro_Status = "Metro"),
+  census_21_other %>% select(any_of(aging_cols)) %>% mutate(Metro_Status = "Other")
+)
+
+# --- Clean Function: only drop NAs ---
+clean_census_data <- function(df) {
+  df %>%
+    drop_na()
+}
+
+aging_16_clean <- clean_census_data(aging_16)
+aging_21_clean <- clean_census_data(aging_21)
+
+# --- Healthcare Classification ---
+is_healthcare_16 <- function(naics_code) ifelse(naics_code == 15, 1, 0)
+is_healthcare_21 <- function(naics_code) ifelse(grepl("^62", as.character(naics_code)), 1, 0)
+
+# --- Add Year, Gender, Healthcare ---
+aging_16_clean <- aging_16_clean %>%
+  mutate(
+    Year = 2016,
+    Gender = case_when(
+      !is.na(Sex) & Sex == 1 ~ "Female",
+      !is.na(Sex) & Sex == 2 ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    NAICS_Healthcare = is_healthcare_16(NAICS)
+  )
+
+aging_21_clean <- aging_21_clean %>%
+  mutate(
+    Year = 2021,
+    Gender = case_when(
+      !is.na(Gender) & Gender == 1 ~ "Female",
+      !is.na(Gender) & Gender == 2 ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    NAICS_Healthcare = is_healthcare_21(NAICS)
+  )
+
+# --- Rename Columns ---
+aging_16_clean <- aging_16_clean %>% rename(
+  Province_Code = PR,
+  CMA_Code = CMA,
+  Age_Group = AGEGRP,
+  Weight = WEIGHT
+)
+
+aging_21_clean <- aging_21_clean %>% rename(
+  Province_Code = PR,
+  CMA_Code = CMA,
+  Age_Group = AGEGRP,
+  Weight = WEIGHT
+)
+
+# --- Select relevant columns (keep Metro_Status) ---
+final_cols <- c(
+  "Province_Code", "CMA_Code", "Gender", "Age_Group",
+  "Weight", "NAICS_Healthcare", "Year", "Metro_Status"
+)
+
+aging_16_clean <- aging_16_clean %>% select(any_of(final_cols))
+aging_21_clean <- aging_21_clean %>% select(any_of(final_cols))
+
+# --- Merge 2016 and 2021 ---
+aging_all <- bind_rows(aging_16_clean, aging_21_clean)
+
+
+```
+
+
+
+
+```{r,echo = FALSE,fig.width=10, fig.height=7}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Define age range mapping
+age_labels <- c(
+  "00-04", "05-09", "10-14", "15-19", "20-24", "25-29", "30-34",
+  "35-39", "40-44", "45-49", "50-54", "55-59", "60-64",
+  "65-69", "70-74", "75-79", "80-84", "85-89", "90+"
+)
+
+# Map Age_Group 1:21 to labels and sum weights
+pyramid_data <- aging_all %>%
+  filter(!is.na(Age_Group), !is.na(Gender), Age_Group >= 1, Age_Group <= 21) %>%
+  mutate(
+    Age_Range = case_when(
+      Age_Group <= length(age_labels) ~ age_labels[Age_Group],
+      TRUE ~ NA_character_
+    ),
+    Gender = factor(Gender, levels = c("Male","Female"))
+  ) %>%
+  filter(!is.na(Age_Range)) %>%
+  group_by(Year, Age_Range, Gender) %>%
+  summarise(Count = sum(Weight, na.rm = TRUE), .groups = "drop") %>%
+  # Negative for Female so bars go left
+  mutate(Count = ifelse(Gender == "Female", -Count, Count))
+
+# Plot
+ggplot(pyramid_data, aes(x = Age_Range, y = Count, fill = Gender)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  facet_wrap(~Year) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) {
+      x <- abs(x)
+      case_when(
+        x >= 1e6 ~ paste0(round(x / 1e6, 1), "M"),
+        x >= 1e3 ~ paste0(round(x / 1e3, 0), "k"),
+        TRUE ~ as.character(x)
+      )
+    },
+    name = "Population (Weighted)"
+  ) +
+  scale_fill_manual(values = c("Male" = "#1A2A4F", "Female" = "#F7A5A5")) +
+  labs(
+    title = "Population Pyramid by Age Group and Gender (2016 vs 2021)",
+    x = "Age Range",
+    fill = "Gender"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+```
+
+
+
+
+```{r,echo = FALSE,fig.width=10, fig.height=7}
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# 1️⃣ Compute senior percentage for each year
+seniors_province <- aging_all %>%
+  filter(Age_Group %in% 16:21) %>%   # 65+ age groups
+  group_by(Province_Code, Year) %>%
+  summarise(Seniors = n(), .groups = "drop") %>%
+  left_join(
+    aging_all %>%
+      group_by(Province_Code, Year) %>%
+      summarise(Total = n(), .groups = "drop"),
+    by = c("Province_Code", "Year")
+  ) %>%
+  mutate(
+    Senior_Percent = Seniors / Total * 100,
+    PR = str_pad(Province_Code, width = 2, side = "left", pad = "0")
+  )
+
+# 2️⃣ Compute change from 2016 to 2021
+senior_change <- seniors_province %>%
+  select(PR, Year, Senior_Percent) %>%
+  pivot_wider(names_from = Year, values_from = Senior_Percent) %>%
+  mutate(Change = `2021` - `2016`)
+
+# 3️⃣ Merge with shapefile
+map_data <- canada_provinces_sf %>%
+  left_join(
+    senior_change %>% select(PR, Change),
+    by = c("PRUID" = "PR")
+  )
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+ggplot(map_data) +
+  geom_sf(aes(fill = Change), color = "black") +
+  scale_fill_gradient(
+    low = "yellow",        # small increase
+    high = "red",          # large increase
+    na.value = "grey80",   # NA
+    name = "Change in % Seniors\n(NA = grey)"
+  ) +
+  labs(
+    title = "Change in Percentage of Seniors (65+) by Province (2016–2021)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+
+
+```{r, echo = FALSE, warning = FALSE, eval = FALSE}
+
+
+# --- Example CMA Lookup Table (use your actual CMA names) ---
+cma_lookup <- tibble::tribble(
+  ~CMA_Code, ~CMA_Name,
+  324, "Halifax",
+  399, "Moncton",
+  421, "Québec",
+  462, "Montréal",
+  499, "Sherbrooke",
+  505, "Ottawa",
+  532, "Oshawa",
+  535, "Toronto",
+  537, "Hamilton",
+  539, "St. Catharines",
+  541, "Kitchener",
+  555, "London",
+  559, "Windsor",
+  577, "Brantford",
+  588, "Kingston",
+  599, "Greater Sudbury",
+  602, "Winnipeg",
+  799, "Regina",
+  825, "Calgary",
+  835, "Edmonton",
+  933, "Vancouver",
+  935, "Victoria",
+  988, "Kelowna",
+  999, "Other"
+)
+
+
+# --- Function to create circular bar plot for a given year ---
+make_circular_cma <- function(data, year, cma_lookup) {
+  df <- data %>%
+    filter(!is.na(CMA_Code), Year == year) %>%
+    group_by(CMA_Code) %>%
+    summarise(
+      Seniors = sum(Weight[Age_Group %in% 16:21], na.rm = TRUE),
+      Total = sum(Weight, na.rm = TRUE),
+      Senior_Percent = Seniors / Total * 100,
+      .groups = "drop"
+    ) %>%
+    left_join(cma_lookup, by = "CMA_Code") %>%
+    filter(!is.na(Senior_Percent), !is.na(CMA_Name)) %>%   # remove NA bars
+    arrange(CMA_Code) %>%
+    mutate(id = row_number())
+
+  # --- Angles for labels ---
+  number_of_bar <- nrow(df)
+  angle <- 90 - 360 * (df$id - 0.5) / number_of_bar
+  hjust <- ifelse(angle < -90, 1, 0)
+  angle_label <- ifelse(angle < -90, angle + 180, angle)
+
+  # --- Generate distinct colors (non-repeating) ---
+  palette <- grDevices::hcl.colors(number_of_bar, palette = "Dynamic")
+
+  # --- Circular plot ---
+  p <- ggplot(df, aes(x = as.factor(id), y = Senior_Percent, fill = factor(CMA_Name))) +
+    geom_bar(stat = "identity", width = 0.8, color = NA) +  # no borders
+    coord_polar(start = 0) +
+    geom_text(aes(
+      x = id,
+      y = Senior_Percent + 1,
+      label = paste0(CMA_Name, " ", round(Senior_Percent, 1)),
+      hjust = hjust,
+      angle = angle_label
+    ),
+    inherit.aes = FALSE,
+    size = 3) +
+    scale_fill_manual(values = palette) +
+    scale_y_continuous(limits = c(0, max(df$Senior_Percent) + 5)) +
+    labs(title = paste0("Senior Population Percentage by CMA (", year, ")")) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+
+  return(p)
+}
+
+# --- Create both plots ---
+plot_2016 <- make_circular_cma(aging_all, 2016, cma_lookup)
+plot_2021 <- make_circular_cma(aging_all, 2021, cma_lookup)
+
+
+plot_2016 + plot_2021
+
+```
+
+
+```{r, echo = FALSE,  fig.width=10, fig.height=10}
+library(dplyr)
+library(ggplot2)
+
+# --- Example CMA Lookup Table (use your actual CMA names) ---
+cma_lookup <- tibble::tribble(
+  ~CMA_Code, ~CMA_Name,
+  324, "Halifax",
+  399, "Moncton",
+  421, "Québec",
+  462, "Montréal",
+  499, "Sherbrooke",
+  505, "Ottawa",
+  532, "Oshawa",
+  535, "Toronto",
+  537, "Hamilton",
+  539, "St. Catharines",
+  541, "Kitchener",
+  555, "London",
+  559, "Windsor",
+  577, "Brantford",
+  588, "Kingston",
+  599, "Greater Sudbury",
+  602, "Winnipeg",
+  799, "Regina",
+  825, "Calgary",
+  835, "Edmonton",
+  933, "Vancouver",
+  935, "Victoria",
+  988, "Kelowna",
+  999, "Other"
+)
+
+
+# --- Function to create circular bar plot for seniors per healthcare worker ---
+make_circular_cma_seniors_per_worker <- function(data, year, cma_lookup) {
+  df <- data %>%
+    filter(!is.na(CMA_Code), Year == year) %>%
+    group_by(CMA_Code) %>%
+    summarise(
+      Seniors = sum(Weight[Age_Group %in% 16:21], na.rm = TRUE),
+      Seniors_in_Healthcare = sum(Weight[Age_Group %in% 16:21 & NAICS_Healthcare == 1], na.rm = TRUE),
+      Seniors_per_Healthcare_Worker = ifelse(Seniors_in_Healthcare > 0, Seniors / Seniors_in_Healthcare, NA),
+      .groups = "drop"
+    ) %>%
+    left_join(cma_lookup, by = "CMA_Code") %>%
+    filter(!is.na(Seniors_per_Healthcare_Worker), !is.na(CMA_Name)) %>%
+    arrange(CMA_Code) %>%
+    mutate(id = row_number())  
+
+  # --- Angles for labels ---
+  number_of_bar <- nrow(df)
+  angle <- 90 - 360 * (df$id - 0.5) / number_of_bar
+  hjust <- ifelse(angle < -90, 1, 0)
+  angle_label <- ifelse(angle < -90, angle + 180, angle)
+
+  # --- Generate distinct colors ---
+  palette <- grDevices::hcl.colors(number_of_bar, palette = "Dynamic")
+
+  # --- Circular plot ---
+  p <- ggplot(df, aes(x = as.factor(id), y = Seniors_per_Healthcare_Worker, fill = factor(CMA_Name))) +
+    geom_bar(stat = "identity", width = 0.8, color = NA) +
+    coord_polar(start = 0) +
+    geom_text(aes(
+      x = id,
+      y = Seniors_per_Healthcare_Worker + 1,  # adjust label position
+      label = paste0(CMA_Name, " ", round(Seniors_per_Healthcare_Worker, 1)),
+      hjust = hjust,
+      angle = angle_label
+    ),
+    inherit.aes = FALSE,
+    size = 3.5,
+    fontface = "bold") +
+    scale_fill_manual(values = palette) +
+    scale_y_continuous(limits = c(0, max(df$Seniors_per_Healthcare_Worker, na.rm = TRUE) + 5)) +
+    labs(title = paste0("Seniors per Healthcare Worker by CMA (", year, ")")) +
+    theme_void() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.margin = margin(0, 0, 0, 0)
+    )
+
+  return(p)
+}
+
+# --- Create 2021 circular plot for seniors per healthcare worker ---
+plot_2021_seniors_per_worker <- make_circular_cma_seniors_per_worker(aging_all, 2021, cma_lookup)
+
+plot_2021_seniors_per_worker
+
+
+```
+
+
+
+
+
+
+
+```{r,echo = FALSE,fig.width=10, fig.height=7}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# --- Province code-to-name and abbreviation mapping ---
+province_names <- c(
+  "10" = "Newfoundland & Labrador",
+  "11" = "Prince Edward Island",
+  "12" = "Nova Scotia",
+  "13" = "New Brunswick",
+  "24" = "Quebec",
+  "35" = "Ontario",
+  "46" = "Manitoba",
+  "47" = "Saskatchewan",
+  "48" = "Alberta",
+  "59" = "British Columbia",
+  "60" = "Yukon",
+  "61" = "Northwest Territories",
+  "62" = "Nunavut"
+)
+
+province_abbr <- c(
+  "Newfoundland & Labrador" = "NL",
+  "Prince Edward Island" = "PE",
+  "Nova Scotia" = "NS",
+  "New Brunswick" = "NB",
+  "Quebec" = "QC",
+  "Ontario" = "ON",
+  "Manitoba" = "MB",
+  "Saskatchewan" = "SK",
+  "Alberta" = "AB",
+  "British Columbia" = "BC",
+  "Yukon" = "YT",
+  "Northwest Territories" = "NT",
+  "Nunavut" = "NU"
+)
+
+# --- Compute senior & healthcare worker percentages ---
+seniors_vs_healthcare <- aging_all %>%
+  mutate(Province = province_names[as.character(Province_Code)]) %>%
+  filter(!is.na(Province)) %>%
+  group_by(Province, Year) %>%
+  summarise(
+    Total_Pop = n(),
+    Seniors = sum(Age_Group >= 16 & Age_Group <= 21, na.rm = TRUE),
+    Healthcare_Worker_Count = sum(NAICS_Healthcare == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Senior_Percent = Seniors / Total_Pop * 100,
+    Healthcare_Percent = Healthcare_Worker_Count / Total_Pop * 100
+  )
+
+# --- Province order (west → east + territories) ---
+province_order <- c(
+  "British Columbia", "Alberta", "Saskatchewan", "Manitoba",
+  "Ontario", "Quebec", "New Brunswick", "Nova Scotia",
+  "Prince Edward Island", "Newfoundland & Labrador",
+  "Yukon", "Northwest Territories", "Nunavut"
+)
+seniors_vs_healthcare$Province <- factor(seniors_vs_healthcare$Province, levels = province_order)
+
+# --- Prepare plotting data ---
+plot_data <- seniors_vs_healthcare %>%
+  mutate(Province_Abbr = province_abbr[as.character(Province)]) %>%
+  select(Province_Abbr, Year, Senior_Percent, Healthcare_Percent) %>%
+  pivot_longer(cols = c(Senior_Percent, Healthcare_Percent),
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = recode(Metric,
+                         "Senior_Percent" = "Senior",
+                         "Healthcare_Percent" = "Healthcare Workforce"))
+
+
+# --- Plot lollipop ---
+ggplot(plot_data, aes(x = Province_Abbr, y = Value, group = Province_Abbr)) +
+  # Connect seniors and healthcare dots
+  geom_segment(data = plot_data %>% pivot_wider(names_from = Metric, values_from = Value),
+               aes(x = Province_Abbr, xend = Province_Abbr,
+                   y = `Senior`, yend = `Healthcare Workforce`),
+               color = "grey60", linewidth = 1) +
+  # Dots
+  geom_point(aes(color = Metric), size = 3) +
+  facet_wrap(~Year, scales = "free_x", nrow = 1, strip.position = "top") +
+  scale_color_manual(values = c("Senior" = "#F25912", "Healthcare Workforce" = "#5C3E94"),
+                     guide = guide_legend(title = NULL)) +
+  labs(
+    title = "Senior Population vs Healthcare Worker Density by Province",
+    x = "Province",
+    y = "Percentage of Population"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top",
+    strip.text = element_text(face = "bold", size = 12),
+    panel.spacing = unit(2, "lines")
+  )
+
+
+```
+
+
+
